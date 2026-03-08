@@ -1,0 +1,9 @@
+{
+  "ApiBaseUrl": "https://example.contoso.com",
+  "ApiKey": "YOUR_API_KEY",
+  "Timeout": 600,
+  "CopyNonRenamedFiles": false,
+  "InputFolder": "C:\\work\\input",
+  "OutputFolder": "C:\\work\\output",
+  "LogFilePath": "C:\\work\\logs\\rename.log"
+}

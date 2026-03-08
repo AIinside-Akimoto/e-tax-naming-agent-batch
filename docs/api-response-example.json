@@ -1,0 +1,26 @@
+{
+  "summary": {
+    "total": 1,
+    "rename_true_count": 1,
+    "rename_false_count": 0
+  },
+  "documents": [
+    {
+      "id": "f1",
+      "original_filename": "請求書_2026年2月分.pdf",
+      "rename": true,
+      "new_filename": "2026-02-28-株式会社サンプル商事-110000.pdf",
+      "notes": "",
+      "extracted": {
+        "date": "2026-02-28",
+        "vendor": "株式会社サンプル商事",
+        "amount": "110000"
+      },
+      "confidence": {
+        "date": 0.98,
+        "vendor": 0.96,
+        "amount": 0.99
+      }
+    }
+  ]
+}
