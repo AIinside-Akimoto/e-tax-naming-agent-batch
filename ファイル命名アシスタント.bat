@@ -39,7 +39,7 @@ set "COPY_ARG="
 if /I "%COPY_NON_RENAMED%"=="true" set "COPY_ARG=-CopyNonRenamedFiles"
 
 set "LOG_ARG="
-if not "%LOG_FILE_PATH%"=="" set "LOG_ARG=-LogFilePath \"%LOG_FILE_PATH%\""
+if not "%LOG_FILE_PATH%"=="" set "LOG_ARG=-LogFilePath "%LOG_FILE_PATH%""
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" ^
   -InputFolder "%INPUT_FOLDER%" ^
