@@ -25,7 +25,7 @@
 ```text
 .
 ├─ Invoke-NamingAgentBatch.ps1
-├─ run.bat
+├─ ファイル命名アシスタント.bat
 ├─ settings.example.json
 ├─ README.md
 ├─ LICENSE
@@ -49,13 +49,13 @@
 ### 1. BAT で実行
 
 ```bat
-run.bat "C:\work\input" "C:\work\output" "https://example.contoso.com" "YOUR_API_KEY"
+ファイル命名アシスタント.bat "C:\work\input" "C:\work\output" "https://example.contoso.com" "YOUR_API_KEY"
 ```
 
 ### 2. リネームできないファイルもコピーする
 
 ```bat
-run.bat "C:\work\input" "C:\work\output" "https://example.contoso.com" "YOUR_API_KEY" 900 true "C:\work\logs\rename.log"
+ファイル命名アシスタント.bat "C:\work\input" "C:\work\output" "https://example.contoso.com" "YOUR_API_KEY" 900 true "C:\work\logs\rename.log"
 ```
 
 ### 3. PowerShell から直接実行
