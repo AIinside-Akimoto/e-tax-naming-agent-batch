@@ -404,6 +404,41 @@ function Move-FileEnsuringDirectory {
 }
 
 #------------------------------------------------------------
+# 入力フォルダー配下の空サブフォルダーを削除する
+#------------------------------------------------------------
+function Remove-EmptySubdirectories {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+
+        [Parameter()]
+        [bool]$WhatIfEnabled = $false
+    )
+
+    $removedCount = 0
+
+    $directories = @(
+        Get-ChildItem -LiteralPath $RootPath -Directory -Recurse -ErrorAction Stop |
+            Sort-Object -Property @{ Expression = { $_.FullName.Length }; Descending = $true }, @{ Expression = { $_.FullName }; Descending = $true }
+    )
+
+    foreach ($directory in $directories) {
+        $childItem = Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop | Select-Object -First 1
+        if ($null -eq $childItem) {
+            if (-not $WhatIfEnabled) {
+                Remove-Item -LiteralPath $directory.FullName -Force -ErrorAction Stop
+            }
+
+            $removedCount++
+            Write-LogEntry -Level INFO -Message ('EMPTY_SOURCE_DIRECTORY_REMOVED path={0} whatif={1}' -f $directory.FullName, $WhatIfEnabled)
+        }
+    }
+
+    return $removedCount
+}
+
+#------------------------------------------------------------
 # API 呼び出し結果を扱いやすいオブジェクトへ整形する
 #------------------------------------------------------------
 function ConvertFrom-NamingApiResponse {
@@ -709,8 +744,9 @@ if ($targetFiles.Count -eq 0) {
         CopiedWithoutRename = 0
         SkippedNonRenamed   = 0
         MovedToExcluded     = 0
-        DeletedSource       = 0
-        Errors              = 0
+        DeletedSource              = 0
+        RemovedEmptySourceDirectories = 0
+        Errors                     = 0
     }
 
     $summaryJson = $summaryObject | ConvertTo-Json -Depth 10 -Compress
@@ -729,9 +765,10 @@ $stats = [ordered]@{
     Renamed             = 0
     CopiedWithoutRename = 0
     SkippedNonRenamed   = 0
-    MovedToExcluded     = 0
-    DeletedSource       = 0
-    Errors              = 0
+    MovedToExcluded            = 0
+    DeletedSource              = 0
+    RemovedEmptySourceDirectories = 0
+    Errors                     = 0
 }
 
 #------------------------------------------------------------
@@ -1293,6 +1330,14 @@ $parallelResults = Invoke-ParallelTaskCollection `
     -WorkerScript $parallelWorker `
     -SharedArguments $sharedArguments
 
+if ($OrganizeSourceFilesAfterCopy.IsPresent) {
+    $removedEmptyDirectoryCount = Remove-EmptySubdirectories -RootPath $resolvedContext.InputFolder -WhatIfEnabled ([bool]$WhatIfPreference)
+    Write-LogEntry -Level INFO -Message ('RemovedEmptySourceDirectories={0}' -f $removedEmptyDirectoryCount)
+}
+else {
+    $removedEmptyDirectoryCount = 0
+}
+
 # 並列実行結果を集計する
 foreach ($result in $parallelResults | Sort-Object -Property SourcePath) {
     $stats.Total++
@@ -1328,6 +1373,8 @@ foreach ($result in $parallelResults | Sort-Object -Property SourcePath) {
         $stats.MovedToExcluded++
     }
 }
+
+$stats.RemovedEmptySourceDirectories = $removedEmptyDirectoryCount
 
 $summaryObject = [pscustomobject]$stats
 $summaryJson = $summaryObject | ConvertTo-Json -Depth 10 -Compress
