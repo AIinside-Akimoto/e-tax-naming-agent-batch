@@ -12,11 +12,17 @@ OutputFolder には InputFolder と同じサブフォルダー構造を再現し
 rename=false または new_filename が空の場合は、CopyNonRenamedFiles の指定に応じて
 元の名前のままコピーするか、コピーせずにスキップします。
 
-OrganizeSourceFilesAfterCopy を指定した場合は、以下を実施します。
-- コピーできたファイル: 元の InputFolder 側ファイルを削除
+OrganizeSourceFilesAfterCopy が有効な場合は、以下を実施します。
+- コピーできたファイル: 元の InputFolder 側ファイルを削除せず、OriginalFolder
+  （未指定時は OutputFolder の親配下の「Original」）配下へ移動
+- 移動先には実行単位の yyyyMMddHHmmss 形式サブフォルダーを作成し、
+  その配下に InputFolder からの相対パスを維持して格納
 - コピーできなかったファイル: InputFolder の親フォルダー配下の
   「対象外」（または ExcludedFolderName で指定した名前）へ
   サブフォルダー構造を維持して移動
+
+さらに、元ファイルと検索用ファイルの対応関係を CSV へ記録します。
+CSV には元ファイルの SHA-256 ハッシュ、抽出結果、移動先情報、エラー情報などを出力します。
 
 API 呼び出しは Parallelism で指定した並列数で実行します。
 既定値は 3 です。
@@ -51,12 +57,20 @@ API が rename=false を返した場合でも、元のファイル名のまま O
 省略時はコピーしません。
 
 .PARAMETER OrganizeSourceFilesAfterCopy
-コピーできたファイルは元フォルダーから削除し、コピーできなかったファイルは
-対象外フォルダーへ移動します。
+コピーできたファイルは元フォルダーから削除せず、OriginalFolder 配下へ移動します。
+既定値は $true です。検証用途などで無効化する場合は $false を指定します。
+
+.PARAMETER OriginalFolder
+OrganizeSourceFilesAfterCopy が有効な場合に、コピーできた元ファイルの保管先ルートとして使用する
+フォルダーです。省略時は OutputFolder の親フォルダー配下の「Original」を使用します。
 
 .PARAMETER ExcludedFolderName
 OrganizeSourceFilesAfterCopy が有効な場合に、コピーできなかったファイルの移動先として作成する
 フォルダー名です。既定値は「対象外」です。
+
+.PARAMETER MappingCsvPath
+元ファイルと検索用ファイルの対応表を出力する CSV ファイルのパスです。
+省略時は OutputFolder 配下に mapping_yyyyMMdd_HHmmss.csv を作成します。
 
 .PARAMETER LogFilePath
 ログファイルの出力先パスです。
@@ -80,7 +94,7 @@ OrganizeSourceFilesAfterCopy が有効な場合に、コピーできなかった
     -ApiKey 'YOUR_API_KEY' `
     -Parallelism 5 `
     -CopyNonRenamedFiles `
-    -OrganizeSourceFilesAfterCopy `
+    -OrganizeSourceFilesAfterCopy $false `
     -Timeout 900 `
     -Verbose `
     -PassThru
@@ -132,11 +146,17 @@ param(
     [switch]$CopyNonRenamedFiles,
 
     [Parameter()]
-    [switch]$OrganizeSourceFilesAfterCopy,
+    [bool]$OrganizeSourceFilesAfterCopy = $true,
+
+    [Parameter()]
+    [string]$OriginalFolder,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$ExcludedFolderName = '対象外',
+
+    [Parameter()]
+    [string]$MappingCsvPath,
 
     [Parameter()]
     [string]$LogFilePath,
@@ -575,6 +595,96 @@ function Test-SupportedExtension {
     return $script:AllowedExtensions -contains $Extension.ToLowerInvariant()
 }
 
+
+#------------------------------------------------------------
+# マッピング CSV の出力先を初期化する
+#------------------------------------------------------------
+function Initialize-MappingCsvFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFolderPath,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$RequestedMappingCsvPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RequestedMappingCsvPath)) {
+        $resolvedCsvPath = Join-Path -Path $OutputFolderPath -ChildPath ("mapping_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    }
+    else {
+        $resolvedCsvPath = $RequestedMappingCsvPath
+    }
+
+    $csvDirectory = Split-Path -Parent $resolvedCsvPath
+    if (-not [string]::IsNullOrWhiteSpace($csvDirectory) -and -not (Test-Path -LiteralPath $csvDirectory)) {
+        $null = New-Item -ItemType Directory -Path $csvDirectory -Force
+    }
+
+    return [System.IO.Path]::GetFullPath($resolvedCsvPath)
+}
+
+#------------------------------------------------------------
+# ファイルの SHA-256 ハッシュを取得する
+#------------------------------------------------------------
+function Get-FileSha256Hash {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+#------------------------------------------------------------
+# CSV へ安全に追記する
+#------------------------------------------------------------
+function Export-MappingCsv {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [object[]]$Rows
+    )
+
+    if ($Rows.Count -eq 0) {
+        return
+    }
+
+    $csvDirectory = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($csvDirectory)) {
+        New-DirectoryIfNeeded -Path $csvDirectory
+    }
+
+    $exportRows = foreach ($row in $Rows) {
+        [pscustomobject]@{
+            処理日時           = $row.ProcessingTimestamp
+            処理結果           = $row.ActionType
+            元ファイルパス     = $row.SourcePath
+            元ファイル名       = $row.SourceName
+            検索用ファイル名   = $row.DestinationFileName
+            検索用ファイルフルパス = $row.DestinationPath
+            取引日             = $row.ExtractedDate
+            取引先名           = $row.ExtractedVendor
+            金額               = $row.ExtractedAmount
+            元ファイルSHA256   = $row.SourceSha256
+            備考               = $row.Notes
+            元相対パス         = $row.SourceRelativePath
+            検索用相対パス     = $row.DestinationRelativePath
+            保管用相対パス     = $row.OriginalStoredRelativePath
+            保管用ファイルフルパス = $row.OriginalStoredPath
+            対象外相対パス     = $row.ExcludedRelativePath
+            エラー内容         = $row.ErrorMessage
+        }
+    }
+
+    $exportRows | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+}
+
 #------------------------------------------------------------
 # 入力パラメーターを検証し、正規化済みの値を返す
 #------------------------------------------------------------
@@ -588,7 +698,11 @@ function Resolve-ExecutionContext {
         [string]$OutputFolderPath,
 
         [Parameter(Mandatory = $true)]
-        [string]$ApiBaseUrlValue
+        [string]$ApiBaseUrlValue,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$OriginalFolderPath
     )
 
     $resolvedInputFolder = [System.IO.Path]::GetFullPath($InputFolderPath)
@@ -604,12 +718,23 @@ function Resolve-ExecutionContext {
 
     New-DirectoryIfNeeded -Path $resolvedOutputFolder
 
+    $resolvedOriginalFolder = ''
+    if ([string]::IsNullOrWhiteSpace($OriginalFolderPath)) {
+        $resolvedOriginalFolder = Join-Path -Path ([System.IO.Path]::GetDirectoryName($resolvedOutputFolder)) -ChildPath 'Original'
+    }
+    else {
+        $resolvedOriginalFolder = [System.IO.Path]::GetFullPath($OriginalFolderPath)
+    }
+
+    New-DirectoryIfNeeded -Path $resolvedOriginalFolder
+
     $apiUrl = [uri]($ApiBaseUrlValue.TrimEnd('/') + '/assist-naming')
 
     return [pscustomobject]@{
-        InputFolder  = $resolvedInputFolder
-        OutputFolder = $resolvedOutputFolder
-        ApiUrl       = $apiUrl
+        InputFolder    = $resolvedInputFolder
+        OutputFolder   = $resolvedOutputFolder
+        OriginalFolder = $resolvedOriginalFolder
+        ApiUrl         = $apiUrl
     }
 }
 
@@ -710,8 +835,14 @@ function Invoke-ParallelTaskCollection {
     }
 }
 
-$resolvedContext = Resolve-ExecutionContext -InputFolderPath $InputFolder -OutputFolderPath $OutputFolder -ApiBaseUrlValue $ApiBaseUrl
+$resolvedContext = Resolve-ExecutionContext -InputFolderPath $InputFolder -OutputFolderPath $OutputFolder -ApiBaseUrlValue $ApiBaseUrl -OriginalFolderPath $OriginalFolder
 $script:LogFilePath = Initialize-LogFile -OutputFolderPath $resolvedContext.OutputFolder -RequestedLogFilePath $LogFilePath
+$script:MappingCsvPath = Initialize-MappingCsvFile -OutputFolderPath $resolvedContext.OutputFolder -RequestedMappingCsvPath $MappingCsvPath
+$script:OriginalRunFolderName = Get-Date -Format 'yyyyMMddHHmmss'
+$script:OriginalRunFolderPath = Join-Path -Path $resolvedContext.OriginalFolder -ChildPath $script:OriginalRunFolderName
+if ($OrganizeSourceFilesAfterCopy) {
+    New-DirectoryIfNeeded -Path $script:OriginalRunFolderPath
+}
 
 # 対象外ファイルの移動先ルートを決定する
 $excludedRootFolder = Join-Path -Path ([System.IO.Path]::GetDirectoryName($resolvedContext.InputFolder)) -ChildPath $ExcludedFolderName
@@ -722,8 +853,11 @@ Write-LogEntry -Level INFO -Message ('ApiUrl={0}' -f $resolvedContext.ApiUrl.Abs
 Write-LogEntry -Level INFO -Message ('Timeout={0}' -f $Timeout)
 Write-LogEntry -Level INFO -Message ('Parallelism={0}' -f $Parallelism)
 Write-LogEntry -Level INFO -Message ('CopyNonRenamedFiles={0}' -f $CopyNonRenamedFiles.IsPresent)
-Write-LogEntry -Level INFO -Message ('OrganizeSourceFilesAfterCopy={0}' -f $OrganizeSourceFilesAfterCopy.IsPresent)
+Write-LogEntry -Level INFO -Message ('OrganizeSourceFilesAfterCopy={0}' -f $OrganizeSourceFilesAfterCopy)
+Write-LogEntry -Level INFO -Message ('OriginalFolder={0}' -f $resolvedContext.OriginalFolder)
+Write-LogEntry -Level INFO -Message ('OriginalRunFolderPath={0}' -f $script:OriginalRunFolderPath)
 Write-LogEntry -Level INFO -Message ('ExcludedRootFolder={0}' -f $excludedRootFolder)
+Write-LogEntry -Level INFO -Message ('MappingCsvPath={0}' -f $script:MappingCsvPath)
 Write-LogEntry -Level INFO -Message ('LogFilePath={0}' -f $script:LogFilePath)
 
 # 処理対象ファイルを再帰的に収集する
@@ -743,8 +877,8 @@ if ($targetFiles.Count -eq 0) {
         Renamed             = 0
         CopiedWithoutRename = 0
         SkippedNonRenamed   = 0
-        MovedToExcluded     = 0
-        DeletedSource              = 0
+        MovedToExcluded            = 0
+        MovedToOriginal            = 0
         RemovedEmptySourceDirectories = 0
         Errors                     = 0
     }
@@ -766,7 +900,7 @@ $stats = [ordered]@{
     CopiedWithoutRename = 0
     SkippedNonRenamed   = 0
     MovedToExcluded            = 0
-    DeletedSource              = 0
+    MovedToOriginal            = 0
     RemovedEmptySourceDirectories = 0
     Errors                     = 0
 }
@@ -1114,6 +1248,8 @@ $parallelWorker = {
     $timeout = [int]$Shared.Timeout
     $copyNonRenamedFiles = [bool]$Shared.CopyNonRenamedFiles
     $organizeSourceFilesAfterCopy = [bool]$Shared.OrganizeSourceFilesAfterCopy
+    $originalRunFolder = [string]$Shared.OriginalRunFolder
+    $originalRunFolderName = [string]$Shared.OriginalRunFolderName
     $excludedRootFolder = [string]$Shared.ExcludedRootFolder
     $logFilePath = [string]$Shared.LogFilePath
     $logMutexName = [string]$Shared.LogMutexName
@@ -1136,9 +1272,18 @@ $parallelWorker = {
         Join-Path -Path $excludedRootFolder -ChildPath $relativeDirectory
     }
 
+    $originalDestinationDirectory = if ([string]::IsNullOrWhiteSpace($relativeDirectory)) {
+        $originalRunFolder
+    }
+    else {
+        Join-Path -Path $originalRunFolder -ChildPath $relativeDirectory
+    }
+
     Write-WorkerLogEntry -Level INFO -Message ('START file={0}' -f $File.FullName) -LogPath $logFilePath -MutexName $logMutexName
 
     try {
+        $processingTimestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $sourceSha256 = (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash
         $apiResult = Invoke-NamingApiRequestLocal -FilePath $File.FullName -ApiUrl $apiUrl -ApiKeyValue $apiKey -TimeoutSeconds $timeout
 
         Write-WorkerLogEntry -Level INFO -Message ('API_UPLOAD file={0} upload_name={1}' -f $File.FullName, $apiResult.UploadFileName) -LogPath $logFilePath -MutexName $logMutexName
@@ -1170,30 +1315,47 @@ $parallelWorker = {
 
             Write-WorkerLogEntry -Level INFO -Message ('RENAMED src={0} dst={1} whatif={2}' -f $File.FullName, $destinationPath, $whatIfEnabled) -LogPath $logFilePath -MutexName $logMutexName
 
-            $sourceDeleted = $false
+            $sourceMovedToOriginal = $false
+            $originalStoredPath = ''
+            $originalStoredRelativePath = ''
+
             if ($organizeSourceFilesAfterCopy) {
+                New-DirectoryIfNeededLocal -Path $originalDestinationDirectory
+                $originalStoredPath = Get-UniqueDestinationPathLocal -DestinationDirectory $originalDestinationDirectory -FileName $File.Name
+
                 if (-not $whatIfEnabled) {
-                    Remove-SourceFileIfExistsLocal -Path $File.FullName
+                    Move-FileEnsuringDirectoryLocal -SourcePath $File.FullName -DestinationPath $originalStoredPath
                 }
 
-                $sourceDeleted = $true
-                Write-WorkerLogEntry -Level INFO -Message ('SOURCE_DELETED src={0} whatif={1}' -f $File.FullName, $whatIfEnabled) -LogPath $logFilePath -MutexName $logMutexName
+                $sourceMovedToOriginal = $true
+                $originalStoredRelativePath = if ($whatIfEnabled) { if ([string]::IsNullOrWhiteSpace($relativePath)) { $originalRunFolderName } else { Join-Path -Path $originalRunFolderName -ChildPath $relativePath } } else { Get-RelativePathLocal -BasePath ([System.IO.Path]::GetDirectoryName($originalRunFolder)) -ChildPath $originalStoredPath }
+                Write-WorkerLogEntry -Level INFO -Message ('SOURCE_MOVED_TO_ORIGINAL src={0} dst={1} whatif={2}' -f $File.FullName, $originalStoredPath, $whatIfEnabled) -LogPath $logFilePath -MutexName $logMutexName
             }
 
             return [pscustomobject]@{
-                SourcePath          = $File.FullName
-                SourceName          = $File.Name
-                ActionType          = 'Renamed'
-                DestinationPath     = $destinationPath
-                DestinationFileName = [System.IO.Path]::GetFileName($destinationPath)
-                Rename              = $apiResult.Rename
-                NewFileName         = $apiResult.NewFileName
-                Notes               = $apiResult.Notes
-                UploadFileName      = $apiResult.UploadFileName
-                RawResponse         = $apiResult.RawResponse
-                SourceDeleted       = $sourceDeleted
-                MovedToExcluded     = $false
-                ErrorMessage        = ''
+                ProcessingTimestamp       = $processingTimestamp
+                SourcePath                = $File.FullName
+                SourceRelativePath        = $relativePath
+                SourceName                = $File.Name
+                SourceSha256              = $sourceSha256
+                ActionType                = 'Renamed'
+                DestinationPath           = $destinationPath
+                DestinationRelativePath   = if ($whatIfEnabled) { if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { [System.IO.Path]::GetFileName($destinationPath) } else { Join-Path -Path $relativeDirectory -ChildPath ([System.IO.Path]::GetFileName($destinationPath)) } } else { Get-RelativePathLocal -BasePath $outputFolder -ChildPath $destinationPath }
+                DestinationFileName       = [System.IO.Path]::GetFileName($destinationPath)
+                Rename                    = $apiResult.Rename
+                NewFileName               = $apiResult.NewFileName
+                Notes                     = $apiResult.Notes
+                UploadFileName            = $apiResult.UploadFileName
+                RawResponse               = $apiResult.RawResponse
+                ExtractedDate             = $extractedDate
+                ExtractedVendor           = $extractedVendor
+                ExtractedAmount           = $extractedAmount
+                MovedToOriginal           = $sourceMovedToOriginal
+                OriginalStoredPath        = $originalStoredPath
+                OriginalStoredRelativePath= $originalStoredRelativePath
+                MovedToExcluded           = $false
+                ExcludedRelativePath      = ''
+                ErrorMessage              = ''
             }
         }
 
@@ -1207,30 +1369,47 @@ $parallelWorker = {
 
             Write-WorkerLogEntry -Level INFO -Message ('COPIED_ORIGINAL src={0} dst={1} whatif={2}' -f $File.FullName, $destinationPath, $whatIfEnabled) -LogPath $logFilePath -MutexName $logMutexName
 
-            $sourceDeleted = $false
+            $sourceMovedToOriginal = $false
+            $originalStoredPath = ''
+            $originalStoredRelativePath = ''
+
             if ($organizeSourceFilesAfterCopy) {
+                New-DirectoryIfNeededLocal -Path $originalDestinationDirectory
+                $originalStoredPath = Get-UniqueDestinationPathLocal -DestinationDirectory $originalDestinationDirectory -FileName $File.Name
+
                 if (-not $whatIfEnabled) {
-                    Remove-SourceFileIfExistsLocal -Path $File.FullName
+                    Move-FileEnsuringDirectoryLocal -SourcePath $File.FullName -DestinationPath $originalStoredPath
                 }
 
-                $sourceDeleted = $true
-                Write-WorkerLogEntry -Level INFO -Message ('SOURCE_DELETED src={0} whatif={1}' -f $File.FullName, $whatIfEnabled) -LogPath $logFilePath -MutexName $logMutexName
+                $sourceMovedToOriginal = $true
+                $originalStoredRelativePath = if ($whatIfEnabled) { if ([string]::IsNullOrWhiteSpace($relativePath)) { $originalRunFolderName } else { Join-Path -Path $originalRunFolderName -ChildPath $relativePath } } else { Get-RelativePathLocal -BasePath ([System.IO.Path]::GetDirectoryName($originalRunFolder)) -ChildPath $originalStoredPath }
+                Write-WorkerLogEntry -Level INFO -Message ('SOURCE_MOVED_TO_ORIGINAL src={0} dst={1} whatif={2}' -f $File.FullName, $originalStoredPath, $whatIfEnabled) -LogPath $logFilePath -MutexName $logMutexName
             }
 
             return [pscustomobject]@{
-                SourcePath          = $File.FullName
-                SourceName          = $File.Name
-                ActionType          = 'CopiedWithoutRename'
-                DestinationPath     = $destinationPath
-                DestinationFileName = [System.IO.Path]::GetFileName($destinationPath)
-                Rename              = $apiResult.Rename
-                NewFileName         = $apiResult.NewFileName
-                Notes               = $apiResult.Notes
-                UploadFileName      = $apiResult.UploadFileName
-                RawResponse         = $apiResult.RawResponse
-                SourceDeleted       = $sourceDeleted
-                MovedToExcluded     = $false
-                ErrorMessage        = ''
+                ProcessingTimestamp       = $processingTimestamp
+                SourcePath                = $File.FullName
+                SourceRelativePath        = $relativePath
+                SourceName                = $File.Name
+                SourceSha256              = $sourceSha256
+                ActionType                = 'CopiedWithoutRename'
+                DestinationPath           = $destinationPath
+                DestinationRelativePath   = if ($whatIfEnabled) { if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { [System.IO.Path]::GetFileName($destinationPath) } else { Join-Path -Path $relativeDirectory -ChildPath ([System.IO.Path]::GetFileName($destinationPath)) } } else { Get-RelativePathLocal -BasePath $outputFolder -ChildPath $destinationPath }
+                DestinationFileName       = [System.IO.Path]::GetFileName($destinationPath)
+                Rename                    = $apiResult.Rename
+                NewFileName               = $apiResult.NewFileName
+                Notes                     = $apiResult.Notes
+                UploadFileName            = $apiResult.UploadFileName
+                RawResponse               = $apiResult.RawResponse
+                ExtractedDate             = $extractedDate
+                ExtractedVendor           = $extractedVendor
+                ExtractedAmount           = $extractedAmount
+                MovedToOriginal           = $sourceMovedToOriginal
+                OriginalStoredPath        = $originalStoredPath
+                OriginalStoredRelativePath= $originalStoredRelativePath
+                MovedToExcluded           = $false
+                ExcludedRelativePath      = ''
+                ErrorMessage              = ''
             }
         }
 
@@ -1252,19 +1431,29 @@ $parallelWorker = {
         }
 
         return [pscustomobject]@{
-            SourcePath          = $File.FullName
-            SourceName          = $File.Name
-            ActionType          = 'SkippedNonRenamed'
-            DestinationPath     = $excludedDestinationPath
-            DestinationFileName = if ([string]::IsNullOrWhiteSpace($excludedDestinationPath)) { '' } else { [System.IO.Path]::GetFileName($excludedDestinationPath) }
-            Rename              = $apiResult.Rename
-            NewFileName         = $apiResult.NewFileName
-            Notes               = $apiResult.Notes
-            UploadFileName      = $apiResult.UploadFileName
-            RawResponse         = $apiResult.RawResponse
-            SourceDeleted       = $false
-            MovedToExcluded     = $movedToExcluded
-            ErrorMessage        = ''
+            ProcessingTimestamp       = $processingTimestamp
+            SourcePath                = $File.FullName
+            SourceRelativePath        = $relativePath
+            SourceName                = $File.Name
+            SourceSha256              = $sourceSha256
+            ActionType                = 'SkippedNonRenamed'
+            DestinationPath           = $excludedDestinationPath
+            DestinationRelativePath   = ''
+            DestinationFileName       = if ([string]::IsNullOrWhiteSpace($excludedDestinationPath)) { '' } else { [System.IO.Path]::GetFileName($excludedDestinationPath) }
+            Rename                    = $apiResult.Rename
+            NewFileName               = $apiResult.NewFileName
+            Notes                     = $apiResult.Notes
+            UploadFileName            = $apiResult.UploadFileName
+            RawResponse               = $apiResult.RawResponse
+            ExtractedDate             = $extractedDate
+            ExtractedVendor           = $extractedVendor
+            ExtractedAmount           = $extractedAmount
+            MovedToOriginal           = $false
+            OriginalStoredPath        = ''
+            OriginalStoredRelativePath= ''
+            MovedToExcluded           = $movedToExcluded
+            ExcludedRelativePath      = if ($movedToExcluded -and -not $whatIfEnabled) { Get-RelativePathLocal -BasePath $excludedRootFolder -ChildPath $excludedDestinationPath } elseif ($movedToExcluded) { $relativePath } else { '' }
+            ErrorMessage              = ''
         }
     }
     catch {
@@ -1291,19 +1480,29 @@ $parallelWorker = {
         }
 
         return [pscustomobject]@{
-            SourcePath          = $File.FullName
-            SourceName          = $File.Name
-            ActionType          = 'Error'
-            DestinationPath     = $excludedDestinationPath
-            DestinationFileName = if ([string]::IsNullOrWhiteSpace($excludedDestinationPath)) { '' } else { [System.IO.Path]::GetFileName($excludedDestinationPath) }
-            Rename              = $false
-            NewFileName         = ''
-            Notes               = ''
-            UploadFileName      = ''
-            RawResponse         = ''
-            SourceDeleted       = $false
-            MovedToExcluded     = $movedToExcluded
-            ErrorMessage        = $_.Exception.Message
+            ProcessingTimestamp       = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            SourcePath                = $File.FullName
+            SourceRelativePath        = $relativePath
+            SourceName                = $File.Name
+            SourceSha256              = if (Test-Path -LiteralPath $File.FullName) { (Get-FileHash -LiteralPath $File.FullName -Algorithm SHA256).Hash } else { '' }
+            ActionType                = 'Error'
+            DestinationPath           = $excludedDestinationPath
+            DestinationRelativePath   = ''
+            DestinationFileName       = if ([string]::IsNullOrWhiteSpace($excludedDestinationPath)) { '' } else { [System.IO.Path]::GetFileName($excludedDestinationPath) }
+            Rename                    = $false
+            NewFileName               = ''
+            Notes                     = ''
+            UploadFileName            = ''
+            RawResponse               = ''
+            ExtractedDate             = ''
+            ExtractedVendor           = ''
+            ExtractedAmount           = ''
+            MovedToOriginal           = $false
+            OriginalStoredPath        = ''
+            OriginalStoredRelativePath= ''
+            MovedToExcluded           = $movedToExcluded
+            ExcludedRelativePath      = if ($movedToExcluded -and -not $whatIfEnabled) { Get-RelativePathLocal -BasePath $excludedRootFolder -ChildPath $excludedDestinationPath } elseif ($movedToExcluded) { $relativePath } else { '' }
+            ErrorMessage              = $_.Exception.Message
         }
     }
 }
@@ -1316,7 +1515,9 @@ $sharedArguments = @{
     ApiKey                       = $ApiKey
     Timeout                      = $Timeout
     CopyNonRenamedFiles          = $CopyNonRenamedFiles.IsPresent
-    OrganizeSourceFilesAfterCopy = $OrganizeSourceFilesAfterCopy.IsPresent
+    OrganizeSourceFilesAfterCopy = $OrganizeSourceFilesAfterCopy
+    OriginalRunFolder            = $script:OriginalRunFolderPath
+    OriginalRunFolderName        = $script:OriginalRunFolderName
     ExcludedRootFolder           = $excludedRootFolder
     LogFilePath                  = $script:LogFilePath
     LogMutexName                 = $script:LogMutexName
@@ -1330,7 +1531,7 @@ $parallelResults = Invoke-ParallelTaskCollection `
     -WorkerScript $parallelWorker `
     -SharedArguments $sharedArguments
 
-if ($OrganizeSourceFilesAfterCopy.IsPresent) {
+if ($OrganizeSourceFilesAfterCopy) {
     $removedEmptyDirectoryCount = Remove-EmptySubdirectories -RootPath $resolvedContext.InputFolder -WhatIfEnabled ([bool]$WhatIfPreference)
     Write-LogEntry -Level INFO -Message ('RemovedEmptySourceDirectories={0}' -f $removedEmptyDirectoryCount)
 }
@@ -1365,8 +1566,8 @@ foreach ($result in $parallelResults | Sort-Object -Property SourcePath) {
         }
     }
 
-    if ($result.SourceDeleted) {
-        $stats.DeletedSource++
+    if ($result.MovedToOriginal) {
+        $stats.MovedToOriginal++
     }
 
     if ($result.MovedToExcluded) {
@@ -1375,6 +1576,9 @@ foreach ($result in $parallelResults | Sort-Object -Property SourcePath) {
 }
 
 $stats.RemovedEmptySourceDirectories = $removedEmptyDirectoryCount
+
+Export-MappingCsv -Path $script:MappingCsvPath -Rows ($parallelResults | Sort-Object -Property SourcePath)
+Write-LogEntry -Level INFO -Message ('MAPPING_CSV_WRITTEN path={0}' -f $script:MappingCsvPath)
 
 $summaryObject = [pscustomobject]$stats
 $summaryJson = $summaryObject | ConvertTo-Json -Depth 10 -Compress
